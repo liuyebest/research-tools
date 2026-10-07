@@ -442,6 +442,82 @@ class Ima:
             return False, f"failed: {e}", ""
 
 
+# ────────────────────── 邮件日报（可选） ──────────────────────
+# 纯标准库 smtplib：邮件由脚本自己发，不依赖云端 agent 是否有邮件工具。
+# 未配置 SMTP_* 环境变量时静默跳过，绝不影响主流程（下载+上传）。
+def _md_to_text(md: str) -> str:
+    s = (md or "").replace("\r\n", "\n")
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"^#{1,6}\s*", "", s, flags=re.M)
+    return s.strip()
+
+
+def _md_to_html(md: str) -> str:
+    s = (md or "").replace("\r\n", "\n")
+    s = re.sub(r"^#{1,6}\s*(.+)$", r"<h3>\1</h3>", s, flags=re.M)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"^\s*[-*]\s+(.+)$", r"<li>\1</li>", s, flags=re.M)
+    s = re.sub(r"\n{2,}", "</p><p>", s)
+    s = s.replace("\n", "<br/>")
+    return f"<html><body style='font-family:sans-serif'>{s}</body></html>"
+
+
+def smtp_reachable(host: str, port: int, timeout: int = 10) -> tuple:
+    """只做 TCP 连通性探测，不需要任何凭据。"""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, "ok"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def send_report_mail(subject: str, body_md: str) -> tuple:
+    """发送日报。返回 (ok, 说明)。未配置时返回 (False, '未配置...')。"""
+    host = (os.environ.get("SMTP_HOST") or "").strip()
+    user = (os.environ.get("SMTP_USER") or "").strip()
+    pwd = os.environ.get("SMTP_PASS") or ""
+    to = [a.strip() for a in (os.environ.get("SMTP_TO") or "").split(",") if a.strip()]
+    if not (host and user and pwd and to):
+        return False, "未配置（缺 SMTP_HOST/USER/PASS/TO），跳过邮件"
+    try:
+        port = int(os.environ.get("SMTP_PORT") or 465)
+    except ValueError:
+        port = 465
+    raw_ssl = (os.environ.get("SMTP_SSL") or "1").strip().lower()
+    use_ssl = raw_ssl not in ("0", "false", "no", "")
+    sender = (os.environ.get("SMTP_FROM") or user).strip()
+
+    import smtplib
+    from email.header import Header
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    m = MIMEMultipart("alternative")
+    m["Subject"] = Header(subject, "utf-8")
+    m["From"] = sender
+    m["To"] = ", ".join(to)
+    m.attach(MIMEText(_md_to_text(body_md), "plain", "utf-8"))
+    m.attach(MIMEText(_md_to_html(body_md), "html", "utf-8"))
+    try:
+        if use_ssl:
+            srv = smtplib.SMTP_SSL(host, port, timeout=30)
+        else:
+            srv = smtplib.SMTP(host, port, timeout=30)
+            srv.starttls()
+        try:
+            srv.login(user, pwd)
+            srv.sendmail(sender, to, m.as_string())
+        finally:
+            try:
+                srv.quit()
+            except Exception:
+                pass
+        return True, f"已发送至 {', '.join(to)}"
+    except Exception as e:
+        return False, f"发送失败: {type(e).__name__}: {e}"
+
+
 # ────────────────────── 主流程 ──────────────────────
 def probe() -> int:
     """探测云端环境能力：python 版本、外网连通性。"""
@@ -460,6 +536,18 @@ def probe() -> int:
         log("  时区: Asia/Shanghai 可用")
     except Exception as e:
         log(f"  时区异常: {e}")
+
+    # 邮件日报能力探测（只需 TCP 可达，不需要凭据）
+    mhost = (os.environ.get("SMTP_HOST") or "smtp.qq.com").strip()
+    try:
+        mport = int(os.environ.get("SMTP_PORT") or 465)
+    except ValueError:
+        mport = 465
+    ok, err = smtp_reachable(mhost, mport)
+    log(f"  SMTP {mhost}:{mport} -> {'可连通' if ok else '不可连通: ' + err}")
+    has_cred = bool(os.environ.get("SMTP_USER")) and bool(os.environ.get("SMTP_PASS"))
+    log(f"  SMTP 凭据: {'已配置' if has_cred else '未配置（邮件将跳过）'}")
+
     log(f"今天(北京时间) = {today_cn()}")
     return 0
 
@@ -646,13 +734,20 @@ def main() -> int:
         for f in failed:
             lines.append(f"- {f['name']} — {f['err']}")
         lines.append("")
-    (outdir / f"cloud-report-{stamp}.md").write_text(
-        "\n".join(lines), encoding="utf-8")
+    report_md = "\n".join(lines)
+    (outdir / f"cloud-report-{stamp}.md").write_text(report_md, encoding="utf-8")
+
+    # 4) 邮件日报：由脚本直接发，不依赖云端 agent 是否有邮件工具。
+    #    未配置 SMTP_* 则跳过；发送失败也不影响主流程返回码。
+    mail_ok, mail_msg = send_report_mail(f"[研报归档] 云端 {stamp}", report_md)
+    log(f"邮件日报: {mail_msg}")
+
     (outdir / f"cloud-result-{stamp}.json").write_text(
         json.dumps({"since": since.isoformat(), "until": until.isoformat(),
                     "pages": pages, "in_window": len(entries),
                     "matched": len(matched), "unmatched": len(unmatched),
-                    "stats": stats, "uploaded": uploaded, "failed": failed},
+                    "stats": stats, "uploaded": uploaded, "failed": failed,
+                    "mail": {"ok": mail_ok, "msg": mail_msg}},
                    ensure_ascii=False, indent=2), encoding="utf-8")
 
     log("──────── 汇总 ────────")
